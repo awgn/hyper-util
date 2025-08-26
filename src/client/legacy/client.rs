@@ -28,12 +28,15 @@ use super::pool::{self, Ver};
 use crate::common::future::poll_fn;
 use crate::common::{lazy as hyper_lazy, timer, Exec, Lazy, SyncWrapper};
 
+use crate::client::legacy::pool::{ConnectionEvent, EventHandler};
+
 type BoxSendFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// A Client to make outgoing HTTP requests.
 ///
 /// `Client` is cheap to clone and cloning is the recommended way to share a `Client`. The
 /// underlying connection pool will be reused.
+///
 #[cfg_attr(docsrs, doc(cfg(any(feature = "http1", feature = "http2"))))]
 pub struct Client<C, B> {
     config: Config,
@@ -62,7 +65,7 @@ pub struct Error {
 }
 
 #[derive(Debug)]
-enum ErrorKind {
+pub enum ErrorKind {
     Canceled,
     ChannelClosed,
     Connect,
@@ -74,30 +77,19 @@ enum ErrorKind {
 
 macro_rules! e {
     ($kind:ident) => {
-        Error {
-            kind: ErrorKind::$kind,
-            source: None,
-            connect_info: None,
-        }
+        Error { kind: ErrorKind::$kind, source: None, connect_info: None }
     };
     ($kind:ident, $src:expr) => {
-        Error {
-            kind: ErrorKind::$kind,
-            source: Some($src.into()),
-            connect_info: None,
-        }
+        Error { kind: ErrorKind::$kind, source: Some($src.into()), connect_info: None }
     };
 }
 
-// We might change this... :shrug:
-type PoolKey = (http::uri::Scheme, http::uri::Authority);
+/// PoolKey is a tuple of the Scheme and Authority of the Uri, used to
+/// identify a connection pool for a specific destination.
+pub type PoolKey = (http::uri::Scheme, http::uri::Authority);
 
 enum TrySendError<B> {
-    Retryable {
-        error: Error,
-        req: Request<B>,
-        connection_reused: bool,
-    },
+    Retryable { error: Error, req: Request<B>, connection_reused: bool },
     Nope(Error),
 }
 
@@ -106,9 +98,7 @@ enum TrySendError<B> {
 /// This is returned by `Client::request` (and `Client::get`).
 #[must_use = "futures do nothing unless polled"]
 pub struct ResponseFuture {
-    inner: SyncWrapper<
-        Pin<Box<dyn Future<Output = Result<Response<hyper::body::Incoming>, Error>> + Send>>,
-    >,
+    inner: SyncWrapper<Pin<Box<dyn Future<Output = Result<Response<hyper::body::Incoming>, Error>> + Send>>>,
 }
 
 // ===== impl Client =====
@@ -223,7 +213,7 @@ where
                     warn!("CONNECT is not allowed for HTTP/1.0");
                     return ResponseFuture::new(future::err(e!(UserUnsupportedRequestMethod)));
                 }
-            }
+            },
             Version::HTTP_2 => (),
             // completely unsupported HTTP version (like HTTP/0.9)!
             other => return ResponseFuture::error_version(other),
@@ -233,7 +223,7 @@ where
             Ok(s) => s,
             Err(err) => {
                 return ResponseFuture::new(future::err(err));
-            }
+            },
         };
 
         ResponseFuture::new(self.clone().send_request(req, pool_key))
@@ -250,24 +240,17 @@ where
             req = match self.try_send_request(req, pool_key.clone()).await {
                 Ok(resp) => return Ok(resp),
                 Err(TrySendError::Nope(err)) => return Err(err),
-                Err(TrySendError::Retryable {
-                    mut req,
-                    error,
-                    connection_reused,
-                }) => {
+                Err(TrySendError::Retryable { mut req, error, connection_reused }) => {
                     if !self.config.retry_canceled_requests || !connection_reused {
                         // if client disabled, don't retry
                         // a fresh connection means we definitely can't retry
                         return Err(error);
                     }
 
-                    trace!(
-                        "unstarted request canceled, trying again (reason={:?})",
-                        error
-                    );
+                    trace!("unstarted request canceled, trying again (reason={:?})", error);
                     *req.uri_mut() = uri.clone();
                     req
-                }
+                },
             }
         }
     }
@@ -291,9 +274,7 @@ where
         if pooled.is_http1() {
             if req.version() == Version::HTTP_2 {
                 warn!("Connection is HTTP/1, but request requires HTTP/2");
-                return Err(TrySendError::Nope(
-                    e!(UserUnsupportedVersion).with_connect_info(pooled.conn_info.clone()),
-                ));
+                return Err(TrySendError::Nope(e!(UserUnsupportedVersion).with_connect_info(pooled.conn_info.clone())));
             }
 
             if self.config.set_host {
@@ -328,17 +309,15 @@ where
                 return if let Some(req) = err.take_message() {
                     Err(TrySendError::Retryable {
                         connection_reused: pooled.is_reused(),
-                        error: e!(Canceled, err.into_error())
-                            .with_connect_info(pooled.conn_info.clone()),
+                        error: e!(Canceled, err.into_error()).with_connect_info(pooled.conn_info.clone()),
                         req,
                     })
                 } else {
                     Err(TrySendError::Nope(
-                        e!(SendRequest, err.into_error())
-                            .with_connect_info(pooled.conn_info.clone()),
+                        e!(SendRequest, err.into_error()).with_connect_info(pooled.conn_info.clone()),
                     ))
                 }
-            }
+            },
         };
 
         // If the Connector included 'extra' info, add to Response...
@@ -366,10 +345,7 @@ where
         Ok(res)
     }
 
-    async fn connection_for(
-        &self,
-        pool_key: PoolKey,
-    ) -> Result<pool::Pooled<PoolClient<B>, PoolKey>, Error> {
+    async fn connection_for(&self, pool_key: PoolKey) -> Result<pool::Pooled<PoolClient<B>, PoolKey>, Error> {
         loop {
             match self.one_connection_for(pool_key.clone()).await {
                 Ok(pooled) => return Ok(pooled),
@@ -379,12 +355,9 @@ where
                         return Err(e!(Connect, reason));
                     }
 
-                    trace!(
-                        "unstarted request canceled, trying again (reason={:?})",
-                        reason,
-                    );
+                    trace!("unstarted request canceled, trying again (reason={:?})", reason,);
                     continue;
-                }
+                },
             };
         }
     }
@@ -395,10 +368,7 @@ where
     ) -> Result<pool::Pooled<PoolClient<B>, PoolKey>, ClientConnectError> {
         // Return a single connection if pooling is not enabled
         if !self.pool.is_enabled() {
-            return self
-                .connect_to(pool_key)
-                .await
-                .map_err(ClientConnectError::Normal);
+            return self.connect_to(pool_key).await.map_err(ClientConnectError::Normal);
         }
 
         // This actually races 2 different futures to try to get a ready
@@ -447,7 +417,7 @@ where
                     self.exec.execute(bg);
                 }
                 Ok(checked_out)
-            }
+            },
             // Connect won, checkout can just be dropped.
             Either::Right((Ok(connected), _checkout)) => Ok(connected),
             // Either checkout or connect could get canceled:
@@ -464,7 +434,7 @@ where
                 } else {
                     Err(ClientConnectError::Normal(e!(Connect, err)))
                 }
-            }
+            },
             Either::Right((Err(err), checkout)) => {
                 if err.is_canceled() {
                     checkout.await.map_err(move |err| {
@@ -477,7 +447,7 @@ where
                 } else {
                     Err(ClientConnectError::Normal(err))
                 }
-            }
+            },
         }
     }
 
@@ -485,8 +455,7 @@ where
     fn connect_to(
         &self,
         pool_key: PoolKey,
-    ) -> impl Lazy<Output = Result<pool::Pooled<PoolClient<B>, PoolKey>, Error>> + Send + Unpin
-    {
+    ) -> impl Lazy<Output = Result<pool::Pooled<PoolClient<B>, PoolKey>, Error>> + Send + Unpin {
         let executor = self.exec.clone();
         let pool = self.pool.clone();
         #[cfg(feature = "http1")]
@@ -510,13 +479,51 @@ where
                     // TODO
                     //crate::Error::new_canceled().with("HTTP/2 connection in progress");
                     return Either::Right(future::err(canceled));
-                }
+                },
             };
+
+            let on_event_error = pool.on_event.clone();
+            let pool_key_clone = pool_key.clone();
+
             Either::Left(
                 connector
                     .connect(super::connect::sealed::Internal, dst)
-                    .map_err(|src| e!(Connect, src))
+                    .map_err(move |err| {
+                        let err_box: Box<dyn StdError + Send + Sync> = err.into();
+                        let mut source_err: Option<&dyn StdError> = Some(err_box.as_ref());
+                        let (mut io_error_kind, mut elapsed_error) = (None, false);
+
+                        while let Some(current_err) = source_err {
+                            use std::io;
+                            if let Some(io_err) = current_err.downcast_ref::<io::Error>() {
+                                io_error_kind = Some(io_err.kind());
+                            } else if current_err.is::<tokio::time::error::Elapsed>() {
+                                elapsed_error = true;
+                            }
+
+                            source_err = current_err.source();
+                        }
+
+                        if let Some(ref handler) = on_event_error {
+                            let is_timeout =
+                                elapsed_error || matches!(io_error_kind, Some(std::io::ErrorKind::TimedOut));
+                            if is_timeout {
+                                handler.call(&pool_key_clone, ConnectionEvent::ConnectionTimeout);
+                            } else {
+                                handler.call(&pool_key_clone, ConnectionEvent::ConnectionError);
+                            }
+                        }
+
+                        // If the connection failed, we need to notify the event connection error.
+
+                        e!(Connect, err_box)
+                    })
                     .and_then(move |io| {
+                        // increment the total connection count for this pool key
+                        if let Some(ref handler) = pool.on_event {
+                            handler.call(&pool_key, ConnectionEvent::NewConnection);
+                        }
+
                         let connected = io.connected();
                         // If ALPN is h2 and we aren't http2_only already,
                         // then we need to convert our pool checkout into
@@ -526,13 +533,13 @@ where
                                 Some(lock) => {
                                     trace!("ALPN negotiated h2, updating pool");
                                     lock
-                                }
+                                },
                                 None => {
                                     // Another connection has already upgraded,
                                     // the pool checkout should finish up for us.
                                     let canceled = e!(Canceled, "ALPN upgraded to HTTP/2");
                                     return Either::Right(future::err(canceled));
-                                }
+                                },
                             }
                         } else {
                             connecting
@@ -542,17 +549,22 @@ where
                         let is_h2 = is_ver_h2 || connected.alpn == Alpn::H2;
 
                         Either::Left(Box::pin(async move {
-                            let tx = if is_h2 {
-                                #[cfg(feature = "http2")] {
-                                    let (mut tx, conn) =
-                                        h2_builder.handshake(io).await.map_err(Error::tx)?;
+                            use scopeguard::{guard, ScopeGuard};
+                            let guard = guard((), |_| {
+                                // increment the destroy connection count for this pool key (if still armed)
+                                if let Some(ref handler) = pool.on_event {
+                                    handler.call(&pool_key, ConnectionEvent::ConnectionError);
+                                }
+                            });
 
-                                    trace!(
-                                        "http2 handshake complete, spawning background dispatcher task"
-                                    );
+                            let tx = if is_h2 {
+                                #[cfg(feature = "http2")]
+                                {
+                                    let (mut tx, conn) = h2_builder.handshake(io).await.map_err(Error::tx)?;
+
+                                    trace!("http2 handshake complete, spawning background dispatcher task");
                                     executor.execute(
-                                        conn.map_err(|e| debug!("client connection error: {}", e))
-                                            .map(|_| ()),
+                                        conn.map_err(|e| debug!("client connection error: {}", e)).map(|_| ()),
                                     );
 
                                     // Wait for 'conn' to ready up before we
@@ -563,18 +575,19 @@ where
                                 #[cfg(not(feature = "http2"))]
                                 panic!("http2 feature is not enabled");
                             } else {
-                                #[cfg(feature = "http1")] {
+                                #[cfg(feature = "http1")]
+                                {
                                     // Perform the HTTP/1.1 handshake on the provided I/O stream.
                                     // Uses the h1_builder to establish a connection, returning a sender (tx) for requests
                                     // and a connection task (conn) that manages the connection lifecycle.
-                                    let (mut tx, conn) =
-                                        h1_builder.handshake(io).await.map_err(crate::client::legacy::client::Error::tx)?;
+                                    let (mut tx, conn) = h1_builder
+                                        .handshake(io)
+                                        .await
+                                        .map_err(crate::client::legacy::client::Error::tx)?;
 
                                     // Log that the HTTP/1.1 handshake has completed successfully.
                                     // This indicates the connection is established and ready for request processing.
-                                    trace!(
-                                        "http1 handshake complete, spawning background dispatcher task"
-                                    );
+                                    trace!("http1 handshake complete, spawning background dispatcher task");
                                     // Create a oneshot channel to communicate errors from the connection task.
                                     // err_tx sends errors from the connection task, and err_rx receives them
                                     // to correlate connection failures with request readiness errors.
@@ -591,7 +604,7 @@ where
                                                 trace!("sending connection error to error channel");
                                                 // Send the error via the oneshot channel, ignoring send failures
                                                 // (e.g., if the receiver is dropped, which is handled later).
-                                                let _ =err_tx.send(e);
+                                                let _ = err_tx.send(e);
                                             })
                                             .map(|_| ()),
                                     );
@@ -613,7 +626,7 @@ where
                                             drop(err_rx);
                                             // Wrap the sender in PoolTx::Http1 for use in the connection pool.
                                             PoolTx::Http1(tx)
-                                        }
+                                        },
                                         // If the sender fails with a closed channel error, check for a specific connection error.
                                         // This distinguishes between a vague ChannelClosed error and an actual connection failure.
                                         Err(e) if e.is_closed() => {
@@ -623,21 +636,23 @@ where
                                             match err_rx.await {
                                                 // If an error was received, it’s a specific connection failure.
                                                 Ok(err) => {
-                                                     // Log the specific connection error for diagnostics.
+                                                    // Log the specific connection error for diagnostics.
                                                     trace!("received connection error: {:?}", err);
                                                     // Return the error wrapped in Error::tx to propagate it.
                                                     return Err(crate::client::legacy::client::Error::tx(err));
-                                                }
+                                                },
                                                 // If the error channel is closed, no specific error was sent.
                                                 // Fall back to the vague ChannelClosed error.
                                                 Err(_) => {
                                                     // Log that the error channel is closed, indicating no specific error.
-                                                    trace!("error channel closed, returning the vague ChannelClosed error");
+                                                    trace!(
+                                                        "error channel closed, returning the vague ChannelClosed error"
+                                                    );
                                                     // Return the original error wrapped in Error::tx.
                                                     return Err(crate::client::legacy::client::Error::tx(e));
-                                                }
+                                                },
                                             }
-                                        }
+                                        },
                                         // For other errors (e.g., timeout, I/O issues), propagate them directly.
                                         // These are not ChannelClosed errors and don’t require error channel checks.
                                         Err(e) => {
@@ -645,21 +660,19 @@ where
                                             trace!("connection readiness failed: {:?}", e);
                                             // Return the error wrapped in Error::tx to propagate it.
                                             return Err(crate::client::legacy::client::Error::tx(e));
-                                        }
+                                        },
                                     }
                                 }
-                                #[cfg(not(feature = "http1"))] {
+                                #[cfg(not(feature = "http1"))]
+                                {
                                     panic!("http1 feature is not enabled");
                                 }
                             };
 
-                            Ok(pool.pooled(
-                                connecting,
-                                PoolClient {
-                                    conn_info: connected,
-                                    tx,
-                                },
-                            ))
+                            // “defuse” the guard...
+                            _ = ScopeGuard::into_inner(guard);
+
+                            Ok(pool.pooled(connecting, PoolClient { conn_info: connected, tx }))
                         }))
                     }),
             )
@@ -735,9 +748,7 @@ impl ResponseFuture {
     where
         F: Future<Output = Result<Response<hyper::body::Incoming>, Error>> + Send + 'static,
     {
-        Self {
-            inner: SyncWrapper::new(Box::pin(value)),
-        }
+        Self { inner: SyncWrapper::new(Box::pin(value)) }
     }
 
     fn error_version(ver: Version) -> Self {
@@ -777,10 +788,7 @@ enum PoolTx<B> {
 }
 
 impl<B> PoolClient<B> {
-    fn poll_ready(
-        &mut self,
-        #[allow(unused_variables)] cx: &mut task::Context<'_>,
-    ) -> Poll<Result<(), Error>> {
+    fn poll_ready(&mut self, #[allow(unused_variables)] cx: &mut task::Context<'_>) -> Poll<Result<(), Error>> {
         match self.tx {
             #[cfg(feature = "http1")]
             PoolTx::Http1(ref mut tx) => tx.poll_ready(cx).map_err(Error::closed),
@@ -859,22 +867,15 @@ where
     fn reserve(self) -> pool::Reservation<Self> {
         match self.tx {
             #[cfg(feature = "http1")]
-            PoolTx::Http1(tx) => pool::Reservation::Unique(PoolClient {
-                conn_info: self.conn_info,
-                tx: PoolTx::Http1(tx),
-            }),
+            PoolTx::Http1(tx) => {
+                pool::Reservation::Unique(PoolClient { conn_info: self.conn_info, tx: PoolTx::Http1(tx) })
+            },
             #[cfg(feature = "http2")]
             PoolTx::Http2(tx) => {
-                let b = PoolClient {
-                    conn_info: self.conn_info.clone(),
-                    tx: PoolTx::Http2(tx.clone()),
-                };
-                let a = PoolClient {
-                    conn_info: self.conn_info,
-                    tx: PoolTx::Http2(tx),
-                };
+                let b = PoolClient { conn_info: self.conn_info.clone(), tx: PoolTx::Http2(tx.clone()) };
+                let a = PoolClient { conn_info: self.conn_info, tx: PoolTx::Http2(tx) };
                 pool::Reservation::Shared(a, b)
-            }
+            },
         }
     }
 
@@ -894,21 +895,18 @@ fn origin_form(uri: &mut Uri) {
             let mut parts = ::http::uri::Parts::default();
             parts.path_and_query = Some(path.clone());
             Uri::from_parts(parts).expect("path is valid uri")
-        }
+        },
         _none_or_just_slash => {
             debug_assert!(Uri::default() == "/");
             Uri::default()
-        }
+        },
     };
     *uri = path
 }
 
 fn absolute_form(uri: &mut Uri) {
     debug_assert!(uri.scheme().is_some(), "absolute_form needs a scheme");
-    debug_assert!(
-        uri.authority().is_some(),
-        "absolute_form needs an authority"
-    );
+    debug_assert!(uri.authority().is_some(), "absolute_form needs an authority");
     // If the URI is to HTTPS, and the connector claimed to be a proxy,
     // then it *should* have tunneled, and so we don't want to send
     // absolute-form in that case.
@@ -930,10 +928,10 @@ fn authority_form(uri: &mut Uri) {
             let mut parts = ::http::uri::Parts::default();
             parts.authority = Some(auth.clone());
             Uri::from_parts(parts).expect("authority is valid")
-        }
+        },
         None => {
             unreachable!("authority_form with relative uri");
-        }
+        },
     };
 }
 
@@ -946,35 +944,27 @@ fn extract_domain(uri: &mut Uri, is_http_connect: bool) -> Result<PoolKey, Error
                 Some(443) => {
                     set_scheme(uri, Scheme::HTTPS);
                     Scheme::HTTPS
-                }
+                },
                 _ => {
                     set_scheme(uri, Scheme::HTTP);
                     Scheme::HTTP
-                }
+                },
             };
             Ok((scheme, auth.clone()))
-        }
+        },
         _ => {
             debug!("Client requires absolute-form URIs, received: {:?}", uri);
             Err(e!(UserAbsoluteUriRequired))
-        }
+        },
     }
 }
 
 fn domain_as_uri((scheme, auth): PoolKey) -> Uri {
-    http::uri::Builder::new()
-        .scheme(scheme)
-        .authority(auth)
-        .path_and_query("/")
-        .build()
-        .expect("domain is valid Uri")
+    http::uri::Builder::new().scheme(scheme).authority(auth).path_and_query("/").build().expect("domain is valid Uri")
 }
 
 fn set_scheme(uri: &mut Uri, scheme: Scheme) {
-    debug_assert!(
-        uri.scheme().is_none(),
-        "set_scheme expects no existing scheme"
-    );
+    debug_assert!(uri.scheme().is_none(), "set_scheme expects no existing scheme");
     let old = std::mem::take(uri);
     let mut parts: ::http::uri::Parts = old.into();
     parts.scheme = Some(scheme);
@@ -991,9 +981,7 @@ fn get_non_default_port(uri: &Uri) -> Option<http::uri::Port<&str>> {
 }
 
 fn is_schema_secure(uri: &Uri) -> bool {
-    uri.scheme_str()
-        .map(|scheme_str| matches!(scheme_str, "wss" | "https"))
-        .unwrap_or_default()
+    uri.scheme_str().map(|scheme_str| matches!(scheme_str, "wss" | "https")).unwrap_or_default()
 }
 
 /// A builder to configure a new [`Client`](Client).
@@ -1027,6 +1015,7 @@ pub struct Builder {
     h2_builder: hyper::client::conn::http2::Builder<Exec>,
     pool_config: pool::Config,
     pool_timer: Option<timer::Timer>,
+    event_handler: Option<EventHandler>,
 }
 
 impl Builder {
@@ -1037,21 +1026,15 @@ impl Builder {
     {
         let exec = Exec::new(executor);
         Self {
-            client_config: Config {
-                retry_canceled_requests: true,
-                set_host: true,
-                ver: Ver::Auto,
-            },
+            client_config: Config { retry_canceled_requests: true, set_host: true, ver: Ver::Auto },
             exec: exec.clone(),
             #[cfg(feature = "http1")]
             h1_builder: hyper::client::conn::http1::Builder::new(),
             #[cfg(feature = "http2")]
             h2_builder: hyper::client::conn::http2::Builder::new(exec),
-            pool_config: pool::Config {
-                idle_timeout: Some(Duration::from_secs(90)),
-                max_idle_per_host: usize::MAX,
-            },
+            pool_config: pool::Config { idle_timeout: Some(Duration::from_secs(90)), max_idle_per_host: usize::MAX },
             pool_timer: None,
+            event_handler: None,
         }
     }
     /// Set an optional timeout for idle sockets being kept-alive.
@@ -1157,8 +1140,7 @@ impl Builder {
     #[cfg(feature = "http1")]
     #[cfg_attr(docsrs, doc(cfg(feature = "http1")))]
     pub fn http1_allow_spaces_after_header_name_in_responses(&mut self, val: bool) -> &mut Self {
-        self.h1_builder
-            .allow_spaces_after_header_name_in_responses(val);
+        self.h1_builder.allow_spaces_after_header_name_in_responses(val);
         self
     }
 
@@ -1196,8 +1178,7 @@ impl Builder {
     #[cfg(feature = "http1")]
     #[cfg_attr(docsrs, doc(cfg(feature = "http1")))]
     pub fn http1_allow_obsolete_multiline_headers_in_responses(&mut self, val: bool) -> &mut Self {
-        self.h1_builder
-            .allow_obsolete_multiline_headers_in_responses(val);
+        self.h1_builder.allow_obsolete_multiline_headers_in_responses(val);
         self
     }
 
@@ -1341,10 +1322,7 @@ impl Builder {
     /// See <https://github.com/hyperium/hyper/issues/2877> for more information.
     #[cfg(feature = "http2")]
     #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
-    pub fn http2_max_pending_accept_reset_streams(
-        &mut self,
-        max: impl Into<Option<usize>>,
-    ) -> &mut Self {
+    pub fn http2_max_pending_accept_reset_streams(&mut self, max: impl Into<Option<usize>>) -> &mut Self {
         self.h2_builder.max_pending_accept_reset_streams(max.into());
         self
     }
@@ -1371,10 +1349,7 @@ impl Builder {
     /// If not set, hyper will use a default.
     #[cfg(feature = "http2")]
     #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
-    pub fn http2_initial_connection_window_size(
-        &mut self,
-        sz: impl Into<Option<u32>>,
-    ) -> &mut Self {
+    pub fn http2_initial_connection_window_size(&mut self, sz: impl Into<Option<u32>>) -> &mut Self {
         self.h2_builder.initial_connection_window_size(sz.into());
         self
     }
@@ -1391,10 +1366,7 @@ impl Builder {
     /// [connection preface]: https://httpwg.org/specs/rfc9113.html#preface
     #[cfg(feature = "http2")]
     #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
-    pub fn http2_initial_max_send_streams(
-        &mut self,
-        initial: impl Into<Option<usize>>,
-    ) -> &mut Self {
+    pub fn http2_initial_max_send_streams(&mut self, initial: impl Into<Option<usize>>) -> &mut Self {
         self.h2_builder.initial_max_send_streams(initial);
         self
     }
@@ -1446,10 +1418,7 @@ impl Builder {
     #[cfg(feature = "tokio")]
     #[cfg(feature = "http2")]
     #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
-    pub fn http2_keep_alive_interval(
-        &mut self,
-        interval: impl Into<Option<Duration>>,
-    ) -> &mut Self {
+    pub fn http2_keep_alive_interval(&mut self, interval: impl Into<Option<Duration>>) -> &mut Self {
         self.h2_builder.keep_alive_interval(interval);
         self
     }
@@ -1531,6 +1500,13 @@ impl Builder {
         self
     }
 
+    /// Provide a event handler to be used for updating statistics.
+    ///
+    pub fn event_handler(&mut self, on_update: EventHandler) -> &mut Self {
+        self.event_handler = Some(on_update);
+        self
+    }
+
     /// Set the maximum write buffer size for each HTTP/2 stream.
     ///
     /// Default is currently 1MB, but may change.
@@ -1597,6 +1573,7 @@ impl Builder {
     {
         let exec = self.exec.clone();
         let timer = self.pool_timer.clone();
+        let on_update = self.event_handler.clone();
         Client {
             config: self.client_config,
             exec: exec.clone(),
@@ -1605,7 +1582,7 @@ impl Builder {
             #[cfg(feature = "http2")]
             h2_builder: self.h2_builder.clone(),
             connector,
-            pool: pool::Pool::new(self.pool_config, exec, timer),
+            pool: pool::Pool::new(self.pool_config, exec, timer, on_update),
         }
     }
 }
@@ -1658,10 +1635,7 @@ impl Error {
 
     #[cfg(any(feature = "http1", feature = "http2"))]
     fn with_connect_info(self, connect_info: Connected) -> Self {
-        Self {
-            connect_info: Some(connect_info),
-            ..self
-        }
+        Self { connect_info: Some(connect_info), ..self }
     }
     fn is_canceled(&self) -> bool {
         matches!(self.kind, ErrorKind::Canceled)
