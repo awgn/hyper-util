@@ -45,6 +45,7 @@ pub struct Client<C, B> {
     #[cfg(feature = "http2")]
     h2_builder: hyper::client::conn::http2::Builder<Exec>,
     pool: pool::Pool<PoolClient<B>, PoolKey>,
+    can_share: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -451,7 +452,7 @@ where
                 Ok(checked_out)
             }
             // Connect won, checkout can just be dropped.
-            Either::Right((Ok(connected), _checkout)) => Ok(connected),
+             Either::Right((Ok(connected), _checkout)) => Ok(connected),
             // Either checkout or connect could get canceled:
             //
             // 1. Connect is canceled if this is HTTP/2 and there is
@@ -500,13 +501,14 @@ where
         let connector = self.connector.clone();
         let dst = domain_as_uri(pool_key);
         let pool_key = pool_key.clone();
+        let can_share = self.can_share;
         hyper_lazy(move || {
             // Try to take a "connecting lock".
             //
             // If the pool_key is for HTTP/2, and there is already a
             // connection being established, then this can't take a
             // second lock. The "connect_to" future is Canceled.
-            let connecting = match pool.connecting(&pool_key, ver) {
+            let connecting = match pool.connecting(&pool_key, ver, can_share ) {
                 Some(lock) => lock,
                 None => {
                     let canceled = e!(Canceled);
@@ -709,6 +711,7 @@ where
                                 PoolClient {
                                     conn_info: connected,
                                     tx,
+                                    can_share ,
                                 },
                             ))
                         }))
@@ -769,6 +772,7 @@ impl<C: Clone, B> Clone for Client<C, B> {
             h2_builder: self.h2_builder.clone(),
             connector: self.connector.clone(),
             pool: self.pool.clone(),
+            can_share : self.can_share,
         }
     }
 }
@@ -818,6 +822,7 @@ impl Future for ResponseFuture {
 struct PoolClient<B> {
     conn_info: Connected,
     tx: PoolTx<B>,
+    can_share: bool,
 }
 
 enum PoolTx<B> {
@@ -913,24 +918,36 @@ where
             PoolTx::Http1(tx) => pool::Reservation::Unique(PoolClient {
                 conn_info: self.conn_info,
                 tx: PoolTx::Http1(tx),
+                can_share: self.can_share,
             }),
             #[cfg(feature = "http2")]
             PoolTx::Http2(tx) => {
-                let b = PoolClient {
-                    conn_info: self.conn_info.clone(),
-                    tx: PoolTx::Http2(tx.clone()),
-                };
-                let a = PoolClient {
-                    conn_info: self.conn_info,
-                    tx: PoolTx::Http2(tx),
-                };
-                pool::Reservation::Shared(a, b)
+                // Fix: if HTTP2 can share connection, return a Reservation::Shared, otherwise return Unique
+                if self.can_share {
+                    let b = PoolClient {
+                        conn_info: self.conn_info.clone(),
+                        tx: PoolTx::Http2(tx.clone()),
+                        can_share: self.can_share,
+                    };
+                    let a = PoolClient {
+                        conn_info: self.conn_info,
+                        tx: PoolTx::Http2(tx),
+                        can_share: self.can_share,
+                    };
+                    pool::Reservation::Shared(a, b)
+                } else {
+                    pool::Reservation::Unique(PoolClient {
+                        conn_info: self.conn_info,
+                        tx: PoolTx::Http2(tx),
+                        can_share: self.can_share,
+                    })
+                }
             }
         }
     }
 
     fn can_share(&self) -> bool {
-        self.is_http2()
+        self.can_share && self.is_http2()
     }
 }
 
@@ -1073,6 +1090,7 @@ pub struct Builder {
     pool_config: pool::Config,
     pool_timer: Option<timer::Timer>,
     event_handler: Option<EventHandler>,
+    can_share: bool,
 }
 
 impl Builder {
@@ -1099,6 +1117,7 @@ impl Builder {
             },
             pool_timer: None,
             event_handler: None,
+            can_share: true,
         }
     }
     /// Set an optional timeout for idle sockets being kept-alive.
@@ -1377,6 +1396,17 @@ impl Builder {
     #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
     pub fn http2_only(&mut self, val: bool) -> &mut Self {
         self.client_config.ver = if val { Ver::Http2 } else { Ver::Auto };
+        self
+    }
+
+    /// Set whether the HTTP/2 connection is enabled to use streams.
+    /// If set to true, multiple requests can be sent over the same connection.
+    ///
+    /// Default is true.
+    #[cfg(feature = "http2")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
+    pub fn http2_connection_sharing(&mut self, val: bool) -> &mut Self {
+        self.can_share = val;
         self
     }
 
@@ -1676,6 +1706,7 @@ impl Builder {
             h2_builder: self.h2_builder.clone(),
             connector,
             pool: pool::Pool::new(self.pool_config, exec, timer, on_event),
+            can_share: self.can_share,
         }
     }
 }

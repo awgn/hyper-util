@@ -237,14 +237,15 @@ impl<T: Poolable, K: Key> Pool<T, K> {
 
     /// Ensure that there is only ever 1 connecting task for HTTP/2
     /// connections. This does nothing for HTTP/1.
-    pub fn connecting(&self, key: &K, ver: Ver) -> Option<Connecting<T, K>> {
-        if ver == Ver::Http2 {
+    pub fn connecting(&self, key: &K, ver: Ver, can_share: bool) -> Option<Connecting<T, K>> {
+        if ver == Ver::Http2 && can_share {
             if let Some(ref enabled) = self.inner {
                 let mut inner = enabled.lock().unwrap();
                 return if inner.connecting.insert(key.clone()) {
                     let connecting = Connecting {
                         key: key.clone(),
                         pool: WeakOpt::downgrade(enabled),
+                        can_share,
                     };
                     Some(connecting)
                 } else {
@@ -260,6 +261,7 @@ impl<T: Poolable, K: Key> Pool<T, K> {
             // in HTTP/1's case, there is never a lock, so we don't
             // need to do anything in Drop.
             pool: WeakOpt::none(),
+            can_share
         })
     }
 
@@ -817,6 +819,7 @@ impl<T, K: Key> Drop for Checkout<T, K> {
 pub struct Connecting<T: Poolable, K: Key> {
     key: K,
     pool: WeakOpt<Mutex<PoolInner<T, K>>>,
+    can_share: bool,
 }
 
 impl<T: Poolable, K: Key> Connecting<T, K> {
@@ -826,7 +829,7 @@ impl<T: Poolable, K: Key> Connecting<T, K> {
             "Connecting::alpn_h2 but already Http2"
         );
 
-        pool.connecting(&self.key, Ver::Http2)
+        pool.connecting(&self.key, Ver::Http2, self.can_share)
     }
 }
 
@@ -953,6 +956,7 @@ mod tests {
         Connecting {
             key,
             pool: WeakOpt::none(),
+            can_share: true,
         }
     }
 
